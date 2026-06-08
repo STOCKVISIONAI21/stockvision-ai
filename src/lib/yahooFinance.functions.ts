@@ -33,11 +33,12 @@ export type LiveHistory = {
   error?: string;
 };
 
-const YF_BASE = "https://query1.finance.yahoo.com/v8/finance/chart";
+// query2 is primary; query1 is fallback — query1 returns 429 Too Many Requests at scale
+const YF_BASE = "https://query2.finance.yahoo.com/v8/finance/chart";
 const UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-const FETCH_TIMEOUT_MS = 12_000;
+const FETCH_TIMEOUT_MS = 15_000;
 
 async function fetchWithTimeout(url: string, init?: RequestInit) {
   const ctrl = new AbortController();
@@ -57,19 +58,38 @@ async function fetchWithTimeout(url: string, init?: RequestInit) {
   }
 }
 
+// Both query1 and query2 are tried — query2 is primary (less rate-limited for chart API)
+const YF_HOSTS = [
+  "https://query2.finance.yahoo.com/v8/finance/chart",
+  "https://query1.finance.yahoo.com/v8/finance/chart",
+];
+
 async function fetchChart(yfSymbol: string, range: string, interval: string) {
-  const url = `${YF_BASE}/${encodeURIComponent(yfSymbol)}?interval=${interval}&range=${range}&includePrePost=false&events=div%2Csplit`;
-  const res = await fetchWithTimeout(url);
-  if (!res.ok) throw new Error(`Yahoo Finance error ${res.status}`);
-  let json: unknown;
-  try {
-    json = await res.json();
-  } catch {
-    throw new Error("Yahoo Finance: invalid JSON response");
+  let lastErr: Error = new Error("No hosts available");
+  for (const base of YF_HOSTS) {
+    const url = `${base}/${encodeURIComponent(yfSymbol)}?interval=${interval}&range=${range}&includePrePost=false&events=div%2Csplit`;
+    try {
+      const res = await fetchWithTimeout(url);
+      if (res.status === 429 || res.status === 401) {
+        lastErr = new Error(`Yahoo Finance error ${res.status} from ${base}`);
+        continue; // try next host
+      }
+      if (!res.ok) throw new Error(`Yahoo Finance error ${res.status}`);
+      let json: unknown;
+      try {
+        json = await res.json();
+      } catch {
+        throw new Error("Yahoo Finance: invalid JSON response");
+      }
+      const r = (json as { chart?: { result?: unknown[] } })?.chart?.result?.[0];
+      if (!r) throw new Error("Yahoo Finance: empty result");
+      return r;
+    } catch (err) {
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      // If it's not a rate-limit error (e.g., network error), still try next host
+    }
   }
-  const r = (json as { chart?: { result?: unknown[] } })?.chart?.result?.[0];
-  if (!r) throw new Error("Yahoo Finance: empty result");
-  return r;
+  throw lastErr;
 }
 
 function parseHistory(result: Record<string, unknown>): LivePricePoint[] {
@@ -119,7 +139,8 @@ function quoteFromMeta(ticker: string, yf: string, currency: string, meta: Recor
 async function fetchQuoteForSymbol(ticker: string): Promise<LiveQuote | null> {
   const { key, yf, currency } = resolveYfSymbol(ticker);
   try {
-    const r = (await fetchChart(yf, "5d", "1d")) as Record<string, unknown>;
+    // Use 1d range — meta.regularMarketPrice is populated regardless of range
+    const r = (await fetchChart(yf, "1d", "1d")) as Record<string, unknown>;
     const meta = (r.meta ?? {}) as Record<string, unknown>;
     const q = quoteFromMeta(key, yf, currency, meta);
     return q.last > 0 ? q : null;
@@ -153,9 +174,14 @@ export const getLiveQuote = createServerFn({ method: "POST" })
 export const getLiveQuotes = createServerFn({ method: "POST" })
   .inputValidator(z.object({ tickers: z.array(z.string().min(1).max(32)).min(1).max(120) }).parse)
   .handler(async ({ data }): Promise<LiveQuote[]> => {
-    const CHUNK = 25;
+    // Use chunks of 10 with a 150ms delay between chunks to stay under rate limits.
+    // query2 allows ~10 req/s unauthenticated; 10 parallel within a chunk is safe.
+    const CHUNK = 10;
+    const DELAY_MS = 150;
     const out: LiveQuote[] = [];
+
     for (let i = 0; i < data.tickers.length; i += CHUNK) {
+      if (i > 0) await new Promise((r) => setTimeout(r, DELAY_MS));
       const chunk = data.tickers.slice(i, i + CHUNK);
       const batch = await Promise.all(
         chunk.map(async (ticker) => {
